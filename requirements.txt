@@ -1,0 +1,23 @@
+# Computer Vision & Image Processing
+opencv-python>=4.8.0
+mediapipe==0.10.21
+numpy>=1.24.0
+
+# GUI: embed cv2 frame vao Tkinter (Tkinter da co san trong Python stdlib)
+Pillow>=10.0.0
+
+# Linear Algebra & Math
+scipy>=1.10.0
+
+# Visualization (cho cac tab Phase 2: PCA Space, Eigen-gestures, Math, Stats)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Action triggering (gui phim tat den Canva)
+pyautogui>=0.9.54
+
+# Baseline so sanh (chi dung cho evaluation, KHONG dung cho PCA core)
+scikit-learn>=1.3.0
+
+# Progress bar (cho thu dataset, training)
+tqdm>=4.65.0
