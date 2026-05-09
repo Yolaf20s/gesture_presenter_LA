@@ -1,14 +1,10 @@
-"""
-app.py - Modern Tkinter GUI for Gesture Presenter.
+"""Tkinter GUI for the Gesture Presenter demo app."""
 
-PHASE 2 STEP 1: PCA Space LIVE section in Analytics tab.
-Other 3 Analytics sections (Eigenvectors, Math, Stats) still placeholder.
-"""
-
+import queue
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -410,15 +406,20 @@ class LiveTab(tk.Frame):
     def update_status(self, text, color):
         self.status_label.configure(text=text, fg=color)
         self._draw_dot(color)
-    def update_gesture(self, gesture_key):
-        self.gesture_badge.set_gesture(gesture_key)
-        label = GESTURE_LABELS.get(gesture_key, gesture_key)
-        if gesture_key == 'idle':
+    def update_gesture(self, gesture_key, tracking_state="ready"):
+        display_key = gesture_key if tracking_state == "ready" else "idle"
+        self.gesture_badge.set_gesture(display_key)
+        if tracking_state != "ready":
+            label = config.TRACKING_DISPLAY_NAME.get(tracking_state, tracking_state)
             self.gesture_label.configure(text=label, fg=COLOR_TEXT_SECONDARY)
         else:
-            self.gesture_label.configure(text=label, fg=GESTURE_COLORS[gesture_key]['dark'])
+            label = GESTURE_LABELS.get(gesture_key, gesture_key)
+            if gesture_key == 'idle':
+                self.gesture_label.configure(text=label, fg=COLOR_TEXT_SECONDARY)
+            else:
+                self.gesture_label.configure(text=label, fg=GESTURE_COLORS[gesture_key]['dark'])
         for key, row in self.gesture_rows.items():
-            row.set_active(key == gesture_key)
+            row.set_active(tracking_state == "ready" and key == gesture_key)
     def update_confidence(self, percent):
         self.conf_progress['value'] = percent
         self.conf_label.configure(text=f"{percent:.0f}%")
@@ -437,12 +438,6 @@ class LiveTab(tk.Frame):
             self.stop_button.set_enabled(False)
 
 
-# ============================================================
-# PCASpaceSection: scatter plot of gestures in eigenspace
-# ============================================================
-# ============================================================
-# PCASpaceSection: scatter plot of gestures in eigenspace
-# ============================================================
 class PCASpaceSection(tk.Frame):
     """Live position of gesture in PCA eigenspace (2D projection)."""
 
@@ -475,62 +470,21 @@ class PCASpaceSection(tk.Frame):
                  font=FONT_SMALL, wraplength=600,
                  justify=tk.LEFT).pack()
 
-    def _load_and_project(self, classifier):
-        """Load training .npy files flexibly, project to PCA space."""
-        APP_DIR = Path(__file__).parent.resolve()
-        DATA_DIR = APP_DIR / "data"
-        if not DATA_DIR.exists():
-            raise FileNotFoundError(f"Data directory not found: {DATA_DIR}")
-
-        all_npy = list(DATA_DIR.rglob("*.npy"))
-        if not all_npy:
-            raise FileNotFoundError(f"No .npy files in {DATA_DIR}")
-
-        GESTURES = ['idle', 'right_arm', 'left_arm', 'thumb_up', 'five_fingers']
-        all_X, all_y = [], []
-        matched = []
-
-        for f in all_npy:
-            name_lower = f.stem.lower()
-            for gesture in sorted(GESTURES, key=len, reverse=True):
-                if gesture in name_lower:
-                    X = np.load(f)
-                    if X.ndim == 1:
-                        X = X.reshape(1, -1)
-                    all_X.append(X)
-                    all_y.extend([gesture] * len(X))
-                    matched.append((f.name, gesture, len(X)))
-                    break
-
-        if not all_X:
-            files_str = "\n".join(f"  - {f.name}" for f in all_npy[:15])
-            raise FileNotFoundError(
-                f"Found {len(all_npy)} .npy files in {DATA_DIR} but none "
-                f"matched any gesture name {GESTURES}.\n\n"
-                f"Files found:\n{files_str}"
-            )
-
-        print(f"[PCA Space] Loaded {len(matched)} files:")
-        for fname, gesture, n in matched:
-            print(f"  {fname} -> {gesture} ({n} samples)")
-
-        X_raw = np.vstack(all_X).astype(np.float64)
-        y_all = np.array(all_y)
-        X_centered = X_raw - classifier.mean
-        X_proj = X_centered @ classifier.eigenvectors
-        return X_proj, y_all
-
     def _init_chart(self):
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
         classifier = PCAClassifier.load()
-        X_proj, y_all = self._load_and_project(classifier)
+        if classifier.train_projections is None or classifier.train_labels is None:
+            raise ValueError("Loaded model does not contain training projections.")
+        if classifier.train_projections.shape[1] < 2:
+            raise ValueError("The loaded PCA model needs at least 2 components.")
 
-        variances = np.var(X_proj, axis=0)
-        total_var = variances.sum()
-        pc1_var = variances[0] / total_var * 100
-        pc2_var = variances[1] / total_var * 100
+        X_proj = classifier.train_projections
+        y_all = classifier.train_labels
+        ratios = classifier.explained_variance_ratio
+        pc1_var = ratios[0] * 100
+        pc2_var = ratios[1] * 100
 
         # Header
         header = tk.Frame(self, bg=COLOR_BG)
@@ -539,8 +493,9 @@ class PCASpaceSection(tk.Frame):
                  fg=COLOR_TEXT_PRIMARY, bg=COLOR_BG,
                  font=FONT_TITLE, anchor=tk.W).pack(anchor=tk.W)
         tk.Label(header,
-                 text=f"Each point is one training sample projected onto "
-                      f"PC1 ({pc1_var:.1f}% var) × PC2 ({pc2_var:.1f}% var). "
+                 text=f"Each point is one training sample from the loaded model "
+                      f"projected onto PC1 ({pc1_var:.1f}% var) × "
+                      f"PC2 ({pc2_var:.1f}% var). "
                       f"⭐ = your current gesture, live.",
                  fg=COLOR_TEXT_SECONDARY, bg=COLOR_BG,
                  font=FONT_SUBTITLE, anchor=tk.W,
@@ -718,6 +673,9 @@ class GesturePresenterApp:
         self.pipeline = None
         self.is_running = False
         self._update_job = None
+        self._worker_thread = None
+        self._stop_event = threading.Event()
+        self._result_queue = queue.Queue(maxsize=1)
 
         self._setup_styles()
         self._build_ui()
@@ -772,6 +730,8 @@ class GesturePresenterApp:
         self.notebook.add(self.help_tab, text="Help")
 
     def start(self):
+        if self.is_running:
+            return
         if self.pipeline is None:
             try:
                 self.pipeline = Pipeline()
@@ -781,72 +741,119 @@ class GesturePresenterApp:
                     f"{type(e).__name__}: {e}",
                 )
                 return
+        self._clear_result_queue()
+        self._stop_event.clear()
         self.is_running = True
         self.live_tab.update_status("Running", COLOR_SUCCESS)
         self.live_tab.set_running(True)
-        self._schedule_next_frame()
+        self._worker_thread = threading.Thread(
+            target=self._pipeline_worker,
+            name="gesture-pipeline-worker",
+            daemon=True,
+        )
+        self._worker_thread.start()
+        self._schedule_result_poll()
 
     def stop(self):
         self.is_running = False
+        self._stop_event.set()
         if self._update_job:
             self.root.after_cancel(self._update_job)
             self._update_job = None
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)
+        self._worker_thread = None
         if self.pipeline:
             self.pipeline.cleanup()
             self.pipeline = None
+        self._clear_result_queue()
 
         self.live_tab.update_status("Stopped", COLOR_INACTIVE)
         self.live_tab.set_running(False)
         self.live_tab.clear_video()
-        self.live_tab.update_gesture('idle')
+        self.live_tab.update_gesture("idle", tracking_state="idle")
         self.live_tab.update_confidence(0)
         self.live_tab.update_metrics(0.0, 0.0)
         self.live_tab.update_last_action("—")
-        # Clear the live point in PCA chart
         self.analytics_tab.update_projection(None)
 
-    def _schedule_next_frame(self):
-        self._update_job = self.root.after(5, self._update_frame)
+    def _schedule_result_poll(self):
+        self._update_job = self.root.after(15, self._poll_results)
 
-    def _update_frame(self):
-        if not self.is_running or self.pipeline is None:
+    def _pipeline_worker(self):
+        try:
+            while not self._stop_event.is_set() and self.pipeline is not None:
+                result = self.pipeline.step(show_overlay=False)
+                if result is None:
+                    self._push_result({"error": "Failed to read a frame from the camera."})
+                    break
+                self._push_result(result)
+        except Exception as exc:
+            self._push_result({"error": f"{type(exc).__name__}: {exc}"})
+
+    def _push_result(self, result):
+        while True:
+            try:
+                self._result_queue.put_nowait(result)
+                return
+            except queue.Full:
+                try:
+                    self._result_queue.get_nowait()
+                except queue.Empty:
+                    return
+
+    def _clear_result_queue(self):
+        while True:
+            try:
+                self._result_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _poll_results(self):
+        if not self.is_running:
             return
+        latest = None
+        while True:
+            try:
+                latest = self._result_queue.get_nowait()
+            except queue.Empty:
+                break
 
-        result = self.pipeline.step(show_overlay=False)
-        if result is None:
-            messagebox.showerror("Camera error",
-                                 "Failed to read frame from camera.")
-            self.stop()
-            return
+        if latest is not None:
+            if "error" in latest:
+                messagebox.showerror("Pipeline error", latest["error"])
+                self.stop()
+                return
+            self._render_result(latest)
 
+        self._schedule_result_poll()
+
+    def _render_result(self, result):
         cw = self.live_tab.video_canvas.winfo_width()
         ch = self.live_tab.video_canvas.winfo_height()
 
-        frame = result['frame']
+        frame = result["frame"]
         if cw > 10 and ch > 10:
             h, w = frame.shape[:2]
             ratio = min(cw / w, ch / h)
             new_w, new_h = int(w * ratio), int(h * ratio)
-            frame = cv2.resize(frame, (new_w, new_h),
-                               interpolation=cv2.INTER_LINEAR)
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        photo = ImageTk.PhotoImage(image=img)
+        photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
 
         self.live_tab.update_video(photo)
-        self.live_tab.update_gesture(result['gesture'])
-        self.live_tab.update_confidence(result['confidence'] * 100)
-        self.live_tab.update_metrics(result['fps'],
-                                     result['cooldown_remaining'])
+        self.live_tab.update_gesture(
+            result["gesture"],
+            tracking_state=result.get("tracking_state", "ready"),
+        )
+        self.live_tab.update_confidence(result["confidence"] * 100)
+        self.live_tab.update_metrics(result["fps"], result["cooldown_remaining"])
 
-        if result['just_triggered']:
-            self.live_tab.update_last_action(result['trigger_message'])
+        if result["just_triggered"]:
+            self.live_tab.update_last_action(result["trigger_message"])
 
-        # Update PCA Space scatter (throttled internally to ~10fps)
-        self.analytics_tab.update_projection(result.get('features_proj'))
-
-        self._schedule_next_frame()
+        self.analytics_tab.update_projection(result.get("features_proj"))
 
     def _on_close(self):
         if self.pipeline:

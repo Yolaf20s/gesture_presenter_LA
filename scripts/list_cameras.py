@@ -1,22 +1,23 @@
-"""Script do tat ca camera kha dung tren may."""
+"""List available camera indices and optionally preview one of them."""
+
+import sys
 
 import cv2
-import sys
 
 
 def list_available_cameras(max_test=5):
     available = []
-    print(f"Dang test camera index 0..{max_test - 1}...\n")
+    print(f"Testing camera indices 0..{max_test - 1}...\n")
 
-    for i in range(max_test):
-        cap = cv2.VideoCapture(i)
+    for index in range(max_test):
+        cap = cv2.VideoCapture(index)
         if not cap.isOpened():
-            print(f"  Index {i}: Khong kha dung")
+            print(f"  Index {index}: unavailable")
             continue
 
         ret, frame = cap.read()
         if not ret or frame is None:
-            print(f"  Index {i}: Mo duoc nhung khong doc duoc frame")
+            print(f"  Index {index}: opened, but could not read a frame")
             cap.release()
             continue
 
@@ -25,8 +26,8 @@ def list_available_cameras(max_test=5):
         fps = cap.get(cv2.CAP_PROP_FPS)
         backend = cap.getBackendName()
 
-        available.append({'index': i, 'width': width, 'height': height})
-        print(f"  Index {i}: OK -- {width}x{height} @ {fps:.0f}fps ({backend})")
+        available.append({"index": index, "width": width, "height": height})
+        print(f"  Index {index}: OK -- {width}x{height} @ {fps:.0f}fps ({backend})")
         cap.release()
 
     return available
@@ -35,15 +36,15 @@ def list_available_cameras(max_test=5):
 def preview_camera(index):
     cap = cv2.VideoCapture(index)
     if not cap.isOpened():
-        print(f"Khong mo duoc camera index {index}")
+        print(f"Could not open camera index {index}")
         return
 
-    print(f"\nDang preview camera index {index}. Nhan ESC de thoat.")
+    print(f"\nPreviewing camera index {index}. Press ESC to quit.")
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        cv2.imshow(f'Camera {index} preview', frame)
+        cv2.imshow(f"Camera {index} preview", frame)
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
@@ -52,16 +53,16 @@ def preview_camera(index):
 
 
 def main():
-    cams = list_available_cameras(max_test=5)
-    if not cams:
-        print("\nKhong tim thay camera nao!")
+    cameras = list_available_cameras(max_test=5)
+    if not cameras:
+        print("\nNo usable cameras found.")
         sys.exit(1)
 
-    print(f"\nTim thay {len(cams)} camera kha dung.\n")
-    choice = input("Nhap index camera muon preview (Enter de bo qua): ").strip()
+    print(f"\nFound {len(cameras)} usable camera(s).\n")
+    choice = input("Enter a camera index to preview (Enter to skip): ").strip()
     if choice.isdigit():
         preview_camera(int(choice))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
