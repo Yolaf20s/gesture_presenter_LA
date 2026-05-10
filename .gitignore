@@ -1,28 +1,59 @@
-# Python
+# Python environments
 venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
+.venv/
+env/
+ENV/
 
-# IDE
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Packaging / build outputs
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Local config and secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editor
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Logs
+# Logs and temporary files
 *.log
-
-# Build
-build/
-dist/
-*.egg-info/
+*.tmp
+*.temp
+*.part
+tmp/
+temp/
 
 # Downloaded MediaPipe Tasks bundles
 models/mediapipe/*.task
+models/mediapipe/*.task.part
+
+# Locally generated training/model artifacts.
+# Already tracked files stay tracked; this only prevents new local outputs from
+# being added accidentally.
+data/dataset/**/*.npy
+models/*.npz
+!models/mediapipe/.gitkeep
