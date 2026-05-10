@@ -14,6 +14,19 @@ from src.dataset import load_feature_sessions, split_feature_dataset, summarize_
 from src.pca_classifier import PCAClassifier
 
 
+class TrainingCancelled(Exception):
+    """Raised when a GUI training job is cancelled before completion."""
+
+
+def _default_log(message=""):
+    print(message)
+
+
+def _check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise TrainingCancelled("Training cancelled.")
+
+
 def stratified_validation_split(X, y, val_ratio=0.2, seed=42):
     """Simple per-class validation split inside the development set."""
     rng = np.random.default_rng(seed)
@@ -50,20 +63,25 @@ def evaluate(clf, X_eval, y_eval):
     return accuracy, confusion
 
 
-def print_confusion_matrix(confusion):
+def format_confusion_matrix(confusion):
     classes = config.GESTURE_CLASSES
-    print("\nConfusion Matrix:")
+    lines = ["", "Confusion Matrix:"]
     header = "True / Pred"
-    print(f"{header:<14}", end="")
+    row = f"{header:<14}"
     for label in classes:
-        print(f"{label[:10]:>11}", end="")
-    print()
+        row += f"{label[:10]:>11}"
+    lines.append(row)
 
     for true_label in classes:
-        print(f"{true_label:<14}", end="")
+        row = f"{true_label:<14}"
         for pred_label in classes:
-            print(f"{confusion[true_label][pred_label]:>11}", end="")
-        print()
+            row += f"{confusion[true_label][pred_label]:>11}"
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def print_confusion_matrix(confusion):
+    print(format_confusion_matrix(confusion))
 
 
 def print_label_distribution(name, labels):
@@ -82,74 +100,107 @@ def flatten_all_sessions(sessions):
     return np.vstack(X_list), np.array(y_list)
 
 
-def main():
-    print("=" * 60)
-    print("TRAIN PCA CLASSIFIER")
-    print("=" * 60 + "\n")
+def train_classifier(log=None, cancel_event=None):
+    """Train, evaluate, save, and return a summary dictionary."""
+    log = log or _default_log
+    log("=" * 60)
+    log("TRAIN PCA CLASSIFIER")
+    log("=" * 60 + "\n")
 
+    _check_cancel(cancel_event)
     sessions = load_feature_sessions()
     total_samples, session_lines = summarize_sessions(sessions)
-    print("Dataset sessions:")
+    log("Dataset sessions:")
     for line in session_lines:
-        print(line)
-    print(f"\nTotal samples: {total_samples}")
+        log(line)
+    log(f"\nTotal samples: {total_samples}")
 
+    _check_cancel(cancel_event)
     X_dev, y_dev, X_test, y_test, split_summary = split_feature_dataset(sessions)
-    print(f"\nEvaluation split strategy: {split_summary['strategy']}")
+    log(f"\nEvaluation split strategy: {split_summary['strategy']}")
     if split_summary["warning"]:
-        print(f"Warning: {split_summary['warning']}")
-    print(f"Train/dev groups: {split_summary['train_groups']}")
-    print(f"Test groups: {split_summary['test_groups']}")
-    print(f"Development set: {len(X_dev)} samples")
-    print(f"Test set: {len(X_test)} samples")
-    print_label_distribution("Development labels", y_dev)
-    print_label_distribution("Test labels", y_test)
+        log(f"Warning: {split_summary['warning']}")
+    log(f"Train/dev groups: {split_summary['train_groups']}")
+    log(f"Test groups: {split_summary['test_groups']}")
+    log(f"Development set: {len(X_dev)} samples")
+    log(f"Test set: {len(X_test)} samples")
 
+    def _log_label_distribution(name, labels):
+        counts = defaultdict(int)
+        for label in labels:
+            counts[label] += 1
+        parts = [
+            f"{label}={counts[label]}"
+            for label in config.GESTURE_CLASSES
+            if counts[label]
+        ]
+        log(f"{name}: {' '.join(parts)}")
+
+    _log_label_distribution("Development labels", y_dev)
+    _log_label_distribution("Test labels", y_test)
+
+    _check_cancel(cancel_event)
     X_train, X_val, y_train, y_val = stratified_validation_split(
         X_dev,
         y_dev,
         val_ratio=0.2,
         seed=config.EVALUATION_RANDOM_SEED,
     )
-    print(f"\nModel-selection split inside development set:")
-    print(f"  train={len(X_train)} samples")
-    print(f"  val={len(X_val)} samples")
+    log(f"\nModel-selection split inside development set:")
+    log(f"  train={len(X_train)} samples")
+    log(f"  val={len(X_val)} samples")
 
     candidate_components = [3, 5, 7, 10, 13]
-    print("\nSelecting PCA dimensionality on validation data:")
-    print(f"{'n_comp':>8} {'train_acc':>12} {'val_acc':>12}")
+    log("\nSelecting PCA dimensionality on validation data:")
+    log(f"{'n_comp':>8} {'train_acc':>12} {'val_acc':>12}")
 
     best_n = config.PCA_N_COMPONENTS
     best_val_acc = -1.0
 
     for n_comp in candidate_components:
+        _check_cancel(cancel_event)
         if n_comp > X_train.shape[1]:
             continue
         clf = PCAClassifier(n_components=n_comp, knn_k=config.KNN_K).fit(X_train, y_train)
         train_acc, _ = evaluate(clf, X_train, y_train)
         val_acc, _ = evaluate(clf, X_val, y_val)
-        print(f"{n_comp:>8} {train_acc * 100:>11.1f}% {val_acc * 100:>11.1f}%")
+        log(f"{n_comp:>8} {train_acc * 100:>11.1f}% {val_acc * 100:>11.1f}%")
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_n = n_comp
 
-    print(f"\nSelected n_components={best_n} based on validation accuracy.")
+    log(f"\nSelected n_components={best_n} based on validation accuracy.")
 
+    _check_cancel(cancel_event)
     eval_model = PCAClassifier(n_components=best_n, knn_k=config.KNN_K).fit(X_dev, y_dev)
     test_acc, confusion = evaluate(eval_model, X_test, y_test)
-    print(f"\nHonest test accuracy: {test_acc * 100:.1f}%")
-    print_confusion_matrix(confusion)
+    log(f"\nHonest test accuracy: {test_acc * 100:.1f}%")
+    log(format_confusion_matrix(confusion))
 
+    _check_cancel(cancel_event)
     X_all, y_all = flatten_all_sessions(sessions)
     deployment_model = PCAClassifier(n_components=best_n, knn_k=config.KNN_K).fit(
         X_all,
         y_all,
     )
+    _check_cancel(cancel_event)
     deployment_model.save(config.PCA_MODEL_PATH)
-    print(
+    log(
         f"\nSaved deployment model trained on all available data -> "
         f"{config.PCA_MODEL_PATH}"
     )
+    return {
+        "total_samples": total_samples,
+        "best_n": best_n,
+        "best_val_accuracy": best_val_acc,
+        "test_accuracy": test_acc,
+        "split_strategy": split_summary["strategy"],
+        "model_path": config.PCA_MODEL_PATH,
+    }
+
+
+def main():
+    train_classifier()
 
 
 if __name__ == "__main__":

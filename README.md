@@ -148,6 +148,10 @@ Tkinter GUI:
 python3 app.py
 ```
 
+The GUI includes a `Training` tab where you can review the current dataset,
+record a new gesture session, cancel collection midway, and automatically
+retrain the PCA model after the new samples are saved.
+
 Pipeline visualizer:
 
 ```bash

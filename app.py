@@ -1,5 +1,8 @@
 """Tkinter GUI for the Gesture Presenter demo app."""
 
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 import queue
 import threading
 import time
@@ -11,35 +14,35 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import config
-from src.pipeline import Pipeline
-from src.pca_classifier import PCAClassifier
+from src.dataset import load_feature_sessions
 
 
 # ============================================================
 # Design tokens
 # ============================================================
-COLOR_BG               = "#FFFFFF"
-COLOR_BG_SECONDARY     = "#F8F9FA"
-COLOR_BG_TERTIARY      = "#F1F3F5"
-COLOR_BG_DARK          = "#15171c"
-COLOR_BG_FRAME         = "#E5E7EB"
+COLOR_BG               = "#F7F5EF"
+COLOR_BG_SECONDARY     = "#ECE7DD"
+COLOR_BG_TERTIARY      = "#FFFDF8"
+COLOR_BG_DARK          = "#111827"
+COLOR_BG_FRAME         = "#D8D0C3"
 
-COLOR_TEXT_PRIMARY     = "#1A1A1A"
-COLOR_TEXT_SECONDARY   = "#6C757D"
-COLOR_TEXT_MUTED       = "#ADB5BD"
+COLOR_TEXT_PRIMARY     = "#1F2933"
+COLOR_TEXT_SECONDARY   = "#5F6C72"
+COLOR_TEXT_MUTED       = "#8B979A"
 
-COLOR_ACCENT           = "#0D6EFD"
-COLOR_SUCCESS          = "#198754"
-COLOR_DANGER           = "#DC3545"
-COLOR_DANGER_HOVER     = "#C82333"
-COLOR_DANGER_ACTIVE    = "#A71D2A"
-COLOR_INACTIVE         = "#ADB5BD"
+COLOR_ACCENT           = "#0F766E"
+COLOR_ACCENT_DARK      = "#115E59"
+COLOR_SUCCESS          = "#1F8A5B"
+COLOR_DANGER           = "#B42318"
+COLOR_DANGER_HOVER     = "#961B12"
+COLOR_DANGER_ACTIVE    = "#7A170F"
+COLOR_INACTIVE         = "#A7B0AA"
 
-COLOR_BORDER           = "#DEE2E6"
-COLOR_BORDER_DARK      = "#6C757D"
+COLOR_BORDER           = "#D6CEC1"
+COLOR_BORDER_DARK      = "#847B70"
 
-COLOR_DISABLED_BG      = "#E9ECEF"
-COLOR_DISABLED_FG      = "#9CA3AF"
+COLOR_DISABLED_BG      = "#E5DED2"
+COLOR_DISABLED_FG      = "#9A9288"
 
 
 GESTURE_COLORS = {
@@ -109,9 +112,9 @@ class PillButton(tk.Canvas):
         self.disabled = False
 
         if variant == 'primary':
-            self.bg_normal = COLOR_DANGER
-            self.bg_hover  = COLOR_DANGER_HOVER
-            self.bg_active = COLOR_DANGER_ACTIVE
+            self.bg_normal = COLOR_ACCENT
+            self.bg_hover  = COLOR_ACCENT_DARK
+            self.bg_active = COLOR_BG_DARK
             self.fg = "white"
             self.border = ""
         else:
@@ -473,6 +476,7 @@ class PCASpaceSection(tk.Frame):
     def _init_chart(self):
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from src.pca_classifier import PCAClassifier
 
         classifier = PCAClassifier.load()
         if classifier.train_projections is None or classifier.train_labels is None:
@@ -582,7 +586,7 @@ class AnalyticsTab(tk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent, bg=COLOR_BG)
         self.app = app
-        self.current = 'pca'
+        self.current = 'stats'
         self._build_ui()
 
     def _build_ui(self):
@@ -618,16 +622,15 @@ class AnalyticsTab(tk.Frame):
 
         self.sections = {}
         for key, name, desc in self.SECTIONS:
-            if key == 'pca':
-                section = PCASpaceSection(content)
-            else:
-                section = PlaceholderSection(content, name, desc)
+            section = PlaceholderSection(content, name, desc)
             section.grid(row=0, column=0, sticky='nsew')
             self.sections[key] = section
 
         self.sections[self.current].tkraise()
 
     def _select(self, key):
+        if key == 'pca' and not isinstance(self.sections.get('pca'), PCASpaceSection):
+            self._replace_pca_section()
         self.current = key
         for k, (row, btn) in self.section_rows.items():
             if k == key:
@@ -644,6 +647,532 @@ class AnalyticsTab(tk.Frame):
         pca = self.sections.get('pca')
         if pca and hasattr(pca, 'update_current'):
             pca.update_current(features_proj)
+
+    def reload_pca(self):
+        old = self.sections.get('pca')
+        if old is None:
+            return
+        if not isinstance(old, PCASpaceSection):
+            return
+        self._replace_pca_section()
+
+    def _replace_pca_section(self):
+        old = self.sections.get('pca')
+        if old is None:
+            return
+        parent = old.master
+        old.destroy()
+        section = PCASpaceSection(parent)
+        section.grid(row=0, column=0, sticky='nsew')
+        self.sections['pca'] = section
+        if self.current == 'pca':
+            section.tkraise()
+
+
+class TrainingTab(tk.Frame):
+    """Collect one gesture session and retrain the model from inside the GUI."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=COLOR_BG)
+        self.app = app
+        self._queue = queue.Queue()
+        self._thread = None
+        self._cancel_event = threading.Event()
+        self._poll_job = None
+        self._preview_photo = None
+        self._build_ui()
+        self.refresh_dataset()
+
+    def _build_ui(self):
+        header = tk.Frame(self, bg=COLOR_BG)
+        header.pack(fill=tk.X, padx=24, pady=(22, 12))
+        tk.Label(
+            header,
+            text="Training",
+            fg=COLOR_TEXT_PRIMARY,
+            bg=COLOR_BG,
+            font=FONT_TITLE,
+        ).pack(anchor=tk.W)
+        tk.Label(
+            header,
+            text="Review saved data, record one new gesture session, then rebuild the model.",
+            fg=COLOR_TEXT_SECONDARY,
+            bg=COLOR_BG,
+            font=FONT_SUBTITLE,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        body = tk.Frame(self, bg=COLOR_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 24))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        left = tk.Frame(body, bg=COLOR_BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        right = tk.Frame(body, bg=COLOR_BG)
+        right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+
+        self._build_dataset_panel(left)
+        self._build_collection_panel(right)
+
+    def _build_dataset_panel(self, parent):
+        top = tk.Frame(parent, bg=COLOR_BG)
+        top.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(top, text="Current Data",
+                 fg=COLOR_TEXT_PRIMARY, bg=COLOR_BG,
+                 font=FONT_BOLD).pack(side=tk.LEFT)
+        ttk.Button(top, text="Refresh", command=self.refresh_dataset).pack(side=tk.RIGHT)
+
+        self.model_status = tk.Label(
+            parent,
+            text="Loading dataset...",
+            fg=COLOR_TEXT_SECONDARY,
+            bg=COLOR_BG,
+            font=FONT_SMALL,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=520,
+        )
+        self.model_status.pack(fill=tk.X, pady=(0, 12))
+
+        table_frame = tk.Frame(parent, bg=COLOR_BORDER, padx=1, pady=1)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+        columns = ("gesture", "people", "sessions", "samples")
+        self.dataset_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            height=10,
+        )
+        for column, text, width in [
+            ("gesture", "Gesture", 140),
+            ("people", "People", 180),
+            ("sessions", "Sessions", 80),
+            ("samples", "Samples", 80),
+        ]:
+            self.dataset_tree.heading(column, text=text)
+            self.dataset_tree.column(column, width=width, anchor=tk.W)
+        self.dataset_tree.pack(fill=tk.BOTH, expand=True)
+
+        log_label = tk.Label(parent, text="Training Log",
+                             fg=COLOR_TEXT_PRIMARY, bg=COLOR_BG,
+                             font=FONT_BOLD)
+        log_label.pack(anchor=tk.W, pady=(14, 6))
+        self.log_text = tk.Text(
+            parent,
+            height=8,
+            bg=COLOR_BG_DARK,
+            fg="#E5E7EB",
+            insertbackground="#E5E7EB",
+            relief=tk.FLAT,
+            font=("Menlo", 10),
+            wrap=tk.WORD,
+        )
+        self.log_text.pack(fill=tk.BOTH)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _build_collection_panel(self, parent):
+        controls = tk.Frame(parent, bg=COLOR_BG_TERTIARY, padx=18, pady=16)
+        controls.pack(fill=tk.X)
+
+        form = tk.Frame(controls, bg=COLOR_BG_TERTIARY)
+        form.pack(fill=tk.X)
+        for col in range(3):
+            form.grid_columnconfigure(col, weight=1)
+
+        tk.Label(form, text="Person",
+                 fg=COLOR_TEXT_SECONDARY, bg=COLOR_BG_TERTIARY,
+                 font=FONT_LABEL).grid(row=0, column=0, sticky=tk.W)
+        self.person_var = tk.StringVar(value="user1")
+        ttk.Entry(form, textvariable=self.person_var).grid(
+            row=1, column=0, sticky="ew", padx=(0, 10), pady=(4, 0)
+        )
+
+        tk.Label(form, text="Gesture",
+                 fg=COLOR_TEXT_SECONDARY, bg=COLOR_BG_TERTIARY,
+                 font=FONT_LABEL).grid(row=0, column=1, sticky=tk.W)
+        self.gesture_var = tk.StringVar(value=config.GESTURE_CLASSES[0])
+        self.gesture_combo = ttk.Combobox(
+            form,
+            textvariable=self.gesture_var,
+            values=config.GESTURE_CLASSES,
+            state="readonly",
+        )
+        self.gesture_combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(4, 0))
+
+        tk.Label(form, text="Samples",
+                 fg=COLOR_TEXT_SECONDARY, bg=COLOR_BG_TERTIARY,
+                 font=FONT_LABEL).grid(row=0, column=2, sticky=tk.W)
+        self.samples_var = tk.IntVar(value=config.SAMPLES_PER_GESTURE)
+        ttk.Spinbox(
+            form,
+            from_=20,
+            to=500,
+            increment=10,
+            textvariable=self.samples_var,
+            width=8,
+        ).grid(row=1, column=2, sticky="ew", pady=(4, 0))
+
+        button_row = tk.Frame(controls, bg=COLOR_BG_TERTIARY)
+        button_row.pack(fill=tk.X, pady=(14, 0))
+        self.collect_button = ttk.Button(
+            button_row,
+            text="Collect and Retrain",
+            command=self.start_collection,
+        )
+        self.collect_button.pack(side=tk.LEFT)
+        self.cancel_button = ttk.Button(
+            button_row,
+            text="Cancel",
+            command=self.cancel,
+        )
+        self.cancel_button.pack(side=tk.LEFT, padx=(10, 0))
+        self.cancel_button.configure(state=tk.DISABLED)
+
+        self.training_status = tk.Label(
+            controls,
+            text="Idle",
+            fg=COLOR_TEXT_SECONDARY,
+            bg=COLOR_BG_TERTIARY,
+            font=FONT_SMALL,
+            anchor=tk.W,
+        )
+        self.training_status.pack(fill=tk.X, pady=(12, 0))
+
+        preview_outer = tk.Frame(parent, bg=COLOR_BG_FRAME, padx=8, pady=8)
+        preview_outer.pack(fill=tk.BOTH, expand=True, pady=(16, 0))
+        self.preview_label = tk.Label(
+            preview_outer,
+            bg=COLOR_BG_DARK,
+            fg=COLOR_TEXT_MUTED,
+            text="Training preview",
+            font=FONT_REGULAR,
+        )
+        self.preview_label.pack(fill=tk.BOTH, expand=True)
+
+    def refresh_dataset(self):
+        for item in self.dataset_tree.get_children():
+            self.dataset_tree.delete(item)
+
+        try:
+            sessions = load_feature_sessions()
+        except FileNotFoundError as exc:
+            self.model_status.configure(text=str(exc), fg=COLOR_TEXT_SECONDARY)
+            return
+
+        by_gesture = defaultdict(lambda: {"people": set(), "sessions": 0, "samples": 0})
+        total_samples = 0
+        for session in sessions:
+            row = by_gesture[session.gesture]
+            row["people"].add(session.person)
+            row["sessions"] += 1
+            row["samples"] += len(session.samples)
+            total_samples += len(session.samples)
+
+        for gesture in config.GESTURE_CLASSES:
+            row = by_gesture.get(gesture)
+            if not row:
+                values = (gesture, "-", 0, 0)
+            else:
+                values = (
+                    gesture,
+                    ", ".join(sorted(row["people"])),
+                    row["sessions"],
+                    row["samples"],
+                )
+            self.dataset_tree.insert("", tk.END, values=values)
+
+        model_text = self._model_summary(total_samples, sessions)
+        self.model_status.configure(text=model_text, fg=COLOR_TEXT_SECONDARY)
+
+    def _model_summary(self, total_samples, sessions):
+        model_path = Path(config.PCA_MODEL_PATH)
+        dataset_text = (
+            f"Dataset: {len(sessions)} session(s), {total_samples} sample(s)."
+        )
+        if not model_path.exists():
+            return f"{dataset_text}\nModel: not trained yet."
+
+        modified = datetime.fromtimestamp(model_path.stat().st_mtime).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        try:
+            with np.load(model_path, allow_pickle=True) as model_data:
+                model_samples = (
+                    len(model_data["train_labels"])
+                    if "train_labels" in model_data.files
+                    else "unknown"
+                )
+                n_components = (
+                    int(model_data["n_components"])
+                    if "n_components" in model_data.files
+                    else "unknown"
+                )
+            return (
+                f"{dataset_text}\n"
+                f"Model: {model_path} | updated {modified} | "
+                f"{model_samples} trained sample(s) | "
+                f"{n_components} PCA components."
+            )
+        except Exception as exc:
+            return f"{dataset_text}\nModel: could not load ({type(exc).__name__}: {exc})."
+
+    def start_collection(self):
+        if self._thread and self._thread.is_alive():
+            return
+        if self.app.is_running:
+            should_stop = messagebox.askyesno(
+                "Stop live preview?",
+                "Training needs the camera. Stop the live preview and continue?",
+            )
+            if not should_stop:
+                return
+            self.app.stop()
+
+        person = self.person_var.get().strip() or "user1"
+        gesture = self.gesture_var.get().strip()
+        try:
+            target = int(self.samples_var.get())
+        except (TypeError, ValueError):
+            messagebox.showerror("Invalid samples", "Sample count must be a number.")
+            return
+        if gesture not in config.GESTURE_CLASSES:
+            messagebox.showerror("Invalid gesture", "Choose a gesture from the list.")
+            return
+        if target < 1:
+            messagebox.showerror("Invalid samples", "Sample count must be at least 1.")
+            return
+
+        self._clear_training_queue()
+        self._cancel_event.clear()
+        self._set_busy(True)
+        self._append_log(f"\nCollecting {target} samples for {person}/{gesture}...")
+        self._thread = threading.Thread(
+            target=self._collection_worker,
+            args=(person, gesture, target),
+            name="gesture-training-worker",
+            daemon=True,
+        )
+        self._thread.start()
+        self._schedule_poll()
+
+    def cancel(self):
+        self._cancel_event.set()
+        self.training_status.configure(text="Cancelling...")
+        self._append_log("Cancel requested.")
+
+    def shutdown(self):
+        self._cancel_event.set()
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
+            self._poll_job = None
+
+    def _collection_worker(self, person, gesture, target):
+        from models.train_pca import TrainingCancelled, train_classifier
+        from src.camera import Camera
+        from src.detector import PoseHandDetector
+        from src.feature_extractor import FeatureExtractor
+        from src.preprocessor import Preprocessor
+
+        cam = None
+        detector = None
+        try:
+            cam = Camera(name="training")
+            pre = Preprocessor()
+            detector = PoseHandDetector()
+            extractor = FeatureExtractor()
+
+            features_list = []
+            last_frame_push = 0.0
+            while len(features_list) < target:
+                if self._cancel_event.is_set():
+                    raise TrainingCancelled("Collection cancelled.")
+                frame = cam.read_frame()
+                if frame is None:
+                    continue
+
+                rgb, bgr = pre.process(frame)
+                detection = detector.detect(rgb)
+                features, meta = extractor.extract(detection, return_meta=True)
+                accepted, reason = self._sample_status(gesture, features, meta)
+                if accepted:
+                    features_list.append(features)
+
+                annotated = detector.draw_skeleton(bgr.copy(), detection)
+                status = (
+                    f"{reason} | visibility={meta['min_pose_visibility']:.2f} "
+                    f"| hands={meta['hands_detected']}"
+                )
+                self._draw_collection_overlay(
+                    annotated,
+                    gesture,
+                    len(features_list),
+                    target,
+                    status,
+                )
+
+                now = time.time()
+                if now - last_frame_push >= 0.05:
+                    last_frame_push = now
+                    self._queue.put({
+                        "type": "progress",
+                        "frame": annotated,
+                        "progress": len(features_list),
+                        "target": target,
+                        "status": status,
+                    })
+
+            save_path = self._save_session(person, gesture, features_list)
+            self._queue.put({"type": "log", "message": f"Saved session: {save_path}"})
+            self._queue.put({"type": "phase", "message": "Retraining model..."})
+
+            summary = train_classifier(
+                log=lambda message="": self._queue.put({
+                    "type": "log",
+                    "message": message,
+                }),
+                cancel_event=self._cancel_event,
+            )
+            self._queue.put({
+                "type": "done",
+                "message": (
+                    f"Training complete. Test accuracy: "
+                    f"{summary['test_accuracy'] * 100:.1f}%"
+                ),
+            })
+        except TrainingCancelled:
+            self._queue.put({"type": "cancelled", "message": "Training cancelled."})
+        except Exception as exc:
+            self._queue.put({
+                "type": "error",
+                "message": f"{type(exc).__name__}: {exc}",
+            })
+        finally:
+            if cam is not None:
+                cam.release()
+            if detector is not None:
+                detector.close()
+
+    def _save_session(self, person, gesture, features_list):
+        gesture_dir = Path(config.DATASET_DIR) / person / gesture
+        gesture_dir.mkdir(parents=True, exist_ok=True)
+        session_name = config.SESSION_FILENAME_TEMPLATE.format(
+            timestamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        save_path = gesture_dir / session_name
+        np.save(save_path, np.asarray(features_list, dtype=np.float32))
+        return save_path
+
+    def _draw_collection_overlay(self, frame, gesture, progress, target, status):
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 88), (17, 24, 39), -1)
+        cv2.putText(
+            frame,
+            f"Collecting {gesture}: {progress}/{target}",
+            (14, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            frame,
+            status,
+            (14, 62),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (190, 230, 220),
+            1,
+        )
+        bar_w = frame.shape[1] - 28
+        filled = int(bar_w * progress / max(1, target))
+        cv2.rectangle(frame, (14, 74), (14 + bar_w, 82), (70, 78, 90), -1)
+        cv2.rectangle(frame, (14, 74), (14 + filled, 82), (15, 118, 110), -1)
+
+    def _sample_status(self, gesture, features, meta):
+        if features is None or meta["tracking_state"] != "ready":
+            return False, meta["tracking_state"]
+        if gesture in config.HAND_REQUIRED_GESTURES and meta["hands_detected"] < 1:
+            return False, "need hand"
+        return True, "accepted"
+
+    def _schedule_poll(self):
+        self._poll_job = self.after(40, self._poll_training_queue)
+
+    def _poll_training_queue(self):
+        while True:
+            try:
+                event = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_training_event(event)
+
+        if self._thread and self._thread.is_alive():
+            self._schedule_poll()
+        else:
+            self._poll_job = None
+            self._set_busy(False)
+
+    def _handle_training_event(self, event):
+        event_type = event.get("type")
+        if event_type == "progress":
+            self.training_status.configure(
+                text=f"{event['progress']}/{event['target']} | {event['status']}"
+            )
+            self._update_preview(event["frame"])
+        elif event_type == "phase":
+            self.training_status.configure(text=event["message"])
+            self._append_log(event["message"])
+        elif event_type == "log":
+            self._append_log(event.get("message", ""))
+        elif event_type == "done":
+            self.training_status.configure(text=event["message"])
+            self._append_log(event["message"])
+            self.refresh_dataset()
+            self.app.analytics_tab.reload_pca()
+        elif event_type == "cancelled":
+            self.training_status.configure(text=event["message"])
+            self._append_log(event["message"])
+            self.refresh_dataset()
+        elif event_type == "error":
+            self.training_status.configure(text="Error")
+            self._append_log(event["message"])
+            messagebox.showerror("Training error", event["message"])
+
+    def _update_preview(self, frame):
+        cw = self.preview_label.winfo_width()
+        ch = self.preview_label.winfo_height()
+        if cw > 10 and ch > 10:
+            h, w = frame.shape[:2]
+            ratio = min(cw / w, ch / h)
+            frame = cv2.resize(
+                frame,
+                (max(1, int(w * ratio)), max(1, int(h * ratio))),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._preview_photo = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+        self.preview_label.configure(image=self._preview_photo, text="")
+
+    def _append_log(self, message):
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, f"{message}\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _set_busy(self, busy):
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.collect_button.configure(state=state)
+        self.gesture_combo.configure(state="disabled" if busy else "readonly")
+        self.cancel_button.configure(state=tk.NORMAL if busy else tk.DISABLED)
+        if not busy and self._cancel_event.is_set():
+            self._cancel_event.clear()
+
+    def _clear_training_queue(self):
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
 
 
 class PlaceholderTab(tk.Frame):
@@ -706,13 +1235,47 @@ class GesturePresenterApp:
                         troughcolor=COLOR_BG_TERTIARY,
                         borderwidth=0, thickness=6,
                         lightcolor=COLOR_ACCENT, darkcolor=COLOR_ACCENT)
+        style.configure(
+            "Treeview",
+            background=COLOR_BG_TERTIARY,
+            fieldbackground=COLOR_BG_TERTIARY,
+            foreground=COLOR_TEXT_PRIMARY,
+            rowheight=28,
+            borderwidth=0,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=COLOR_BG_SECONDARY,
+            foreground=COLOR_TEXT_SECONDARY,
+            font=FONT_LABEL,
+        )
 
     def _build_ui(self):
+        header = tk.Frame(self.root, bg=COLOR_BG, padx=24, pady=16)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text="Gesture Presenter",
+            fg=COLOR_TEXT_PRIMARY,
+            bg=COLOR_BG,
+            font=(FONT_FAMILY, 20, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            header,
+            text="Camera control, training, and PCA diagnostics",
+            fg=COLOR_TEXT_SECONDARY,
+            bg=COLOR_BG,
+            font=FONT_SUBTITLE,
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
         self.live_tab = LiveTab(self.notebook, self)
         self.notebook.add(self.live_tab, text="Live")
+
+        self.training_tab = TrainingTab(self.notebook, self)
+        self.notebook.add(self.training_tab, text="Training")
 
         self.analytics_tab = AnalyticsTab(self.notebook, self)
         self.notebook.add(self.analytics_tab, text="Analytics")
@@ -734,6 +1297,8 @@ class GesturePresenterApp:
             return
         if self.pipeline is None:
             try:
+                from src.pipeline import Pipeline
+
                 self.pipeline = Pipeline()
             except Exception as e:
                 messagebox.showerror(
@@ -856,6 +1421,8 @@ class GesturePresenterApp:
         self.analytics_tab.update_projection(result.get("features_proj"))
 
     def _on_close(self):
+        if hasattr(self, "training_tab"):
+            self.training_tab.shutdown()
         if self.pipeline:
             self.stop()
         print("[App] Closing...")
