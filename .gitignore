@@ -54,6 +54,5 @@ models/mediapipe/*.task.part
 # Locally generated training/model artifacts.
 # Already tracked files stay tracked; this only prevents new local outputs from
 # being added accidentally.
-data/dataset/**/*.npy
 models/*.npz
 !models/mediapipe/.gitkeep
